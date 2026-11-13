@@ -9,12 +9,12 @@ train_set="train_clean_100"
 valid_set="dev"
 test_sets="test_clean test_other dev_clean dev_other"
 
-asr_config=conf/train_asr.yaml
-inference_config=conf/decode_asr.yaml
+asr_config=conf/tuning/train_conformer_ctc.yaml
+inference_config=conf/tuning/decode_ctc_bs1.yaml
 
 ./asr.sh \
     --lang en \
-    --ngpu 1 \
+    --ngpu 8 \
     --nj 16 \
     --gpu_inference true \
     --inference_nj 2 \

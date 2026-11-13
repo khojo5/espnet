@@ -6,7 +6,7 @@ import numpy as np
 import torch
 from typeguard import typechecked
 
-from espnet2.asr.ctc import CTC
+from espnet2.asr.ctc import CTC, LabelPriorCTC
 from espnet2.asr.decoder.abs_decoder import AbsDecoder
 from espnet2.asr.decoder.hugging_face_transformers_decoder import (  # noqa: H301
     HuggingFaceTransformersDecoder,
@@ -285,7 +285,8 @@ class ASRTask(AbsTask):
             "--ctc_conf",
             action=NestedDictAction,
             default=get_default_kwargs(CTC),
-            help="The keyword arguments for CTC class.",
+            help="The keyword arguments for CTC class. "
+            "LabelPriorCTC is used if ctc_type is label_prior.",
         )
         group.add_argument(
             "--joint_net_conf",
@@ -581,7 +582,11 @@ class ASRTask(AbsTask):
             joint_network = None
 
         # 6. CTC
-        ctc = CTC(
+        if args.ctc_conf.get("ctc_type") == "label_prior":
+            ctc_class = LabelPriorCTC
+        else:
+            ctc_class = CTC
+        ctc = ctc_class(
             odim=vocab_size, encoder_output_size=encoder_output_size, **args.ctc_conf
         )
 

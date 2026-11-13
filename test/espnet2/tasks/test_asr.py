@@ -38,6 +38,28 @@ def test_print_config_and_load_it(tmp_path):
     parser.parse_args(["--config", str(config_file)])
 
 
+@pytest.mark.parametrize(
+    "ctc_conf, ctc_class",
+    [
+        ([], "CTC"),
+        (["--ctc_conf", "ctc_type=label_prior"], "LabelPriorCTC"),
+        (["--ctc_conf", "{ctc_type: label_prior}"], "LabelPriorCTC"),
+    ],
+)
+def test_build_model_ctc_class(tmp_path, ctc_conf, ctc_class):
+    if ctc_class == "LabelPriorCTC":
+        pytest.importorskip("k2")
+    token_list = tmp_path / "tokens.txt"
+    token_list.write_text("<blank>\na\nb\n<sos/eos>\n")
+    args = ASRTask.get_parser().parse_args(
+        ["--token_list", str(token_list), "--input_size", "8"]
+        + ["--encoder", "rnn", "--decoder", "rnn"]
+        + ctc_conf
+    )
+    model = ASRTask.build_model(args)
+    assert type(model.ctc).__name__ == ctc_class
+
+
 @pytest.mark.parametrize("inference", [True, False])
 def test_optional_data_names(inference):
     retval = ASRTask.optional_data_names(True, inference)
