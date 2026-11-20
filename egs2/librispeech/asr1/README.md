@@ -1,3 +1,100 @@
+# Phoneme data preparation
+
+After preparing the original LibriSpeech data with [local/data.sh](local/data.sh),
+create separate phoneme datasets before speed perturbation:
+
+```bash
+cd egs2/librispeech/asr1
+bash local/prepare_phoneme_data.sh --textgrid-root /path/to/textgrids
+```
+
+The default sets are `train_960 dev test_clean test_other dev_clean dev_other`.
+To convert only selected, already prepared sets:
+
+```bash
+bash local/prepare_phoneme_data.sh \
+    --textgrid-root /path/to/textgrids dev_clean test_clean
+```
+
+[local/prepare_phoneme_data.sh](local/prepare_phoneme_data.sh) creates
+`data/<set>_phn` using the standard data-directory copy utility and
+[local/textgrid_to_phoneme.py](local/textgrid_to_phoneme.py). Utterance IDs, speaker IDs and audio
+references are preserved; audio files are not copied or re-encoded. The original
+datasets are not modified. The output `text` contains one utterance per line:
+
+```text
+utt001 HH AH0 L OW1 W ER1 L D
+```
+
+TextGrid parsing requires `praatio` (included in `espnet[recipe]`) in the recipe's
+Python environment; no G2P is run by default. The TextGrid root is searched recursively once
+for all selected sets, including combined sets such as `train_960` and `dev`.
+File stems must match the utterance IDs in the input `text`; `.TextGrid`
+extensions are matched case-insensitively. Unselected TextGrids are ignored.
+
+The default interval tier is `phones`; override it with `--phone-tier <name>`.
+Labels are extracted in time order without using the timestamps as training
+targets. Empty labels, `sil` and `sp` are removed case-insensitively, while `spn`
+is retained. All remaining labels retain their spelling and stress digits, and
+repeated phones are not collapsed. Multi-token labels, missing tiers, empty phone
+sequences, missing TextGrids and duplicate TextGrids for a selected utterance ID
+are errors. Labels reflect the supplied TextGrids, which may themselves have
+been produced by forced alignment rather than manual annotation.
+
+To preserve the utterance count when some TextGrids are missing, explicitly
+enable English G2P for only those utterances:
+
+```bash
+bash local/prepare_phoneme_data.sh \
+    --textgrid-root /path/to/textgrids --missing-textgrid g2p
+```
+
+This requires `g2p_en` (included in `espnet[tts]`) and its NLTK resources in the
+recipe's Python environment. The English G2P backend is initialized only if
+TextGrids are actually missing. It uses the original transcript, removes
+word-separator spaces, and retains stress digits. Available TextGrid labels
+remain unchanged; invalid TextGrids, tiers or phone labels still cause errors.
+Each fallback utterance is logged and listed in
+`data/<set>_phn/g2p_fallback_utt_ids` (empty when no fallback was needed).
+These fallback phones are estimated pronunciations, not TextGrid annotations.
+For direct text extraction, the report is saved as
+`<output>.g2p_fallback_utt_ids`. Reports are not overwritten.
+The default `--missing-textgrid error` still stops on any missing TextGrid.
+
+To extract only a phoneme text file without copying a data directory:
+
+```bash
+python local/textgrid_to_phoneme.py \
+    --textgrid-root /path/to/textgrids \
+    --input data/dev_clean/text --output data/dev_clean/text.phn
+```
+
+Output text files are not overwritten. The legacy
+[local/gen_phoneme.py](local/gen_phoneme.py) remains available separately, but is
+not called by this preparation pipeline, including the optional G2P fallback.
+
+All inputs and output paths are checked before conversion begins. Existing
+outputs, including symlinks, are refused rather than overwritten. Each dataset
+is validated in a temporary directory before any datasets are published. On
+extraction or validation failure, temporary files are removed and no outputs
+are published. If publication fails, any earlier, successfully published
+datasets remain intact. When retrying, specify only the remaining sets.
+The script does not download data or launch training.
+
+For subsequent ASR runs, select the `_phn` train, validation and test sets, and
+use `--token_type word --g2p none --cleaner none --use_lm false`.
+Here `word` means whitespace-delimited tokens, so each token is a phone.
+Set `--lm_train_text "data/train_960_phn/text"` as well: that input is used for
+vocabulary generation even when LM training is disabled. Do not mix in the
+original external word transcripts.
+
+Start subsequent runs from ASR stage 2 (speed perturbation) rather than stage 1,
+which calls the original data preparation. Complete stages 2--4 before resuming
+vocabulary generation and training; when resuming, keep the same phoneme
+settings. Training configuration is not changed by this script. For pure CTC,
+use `model_conf.ctc_weight: 1.0` and a loss-based best-model criterion rather
+than attention accuracy.
+
 # Multi-Blank Transducer
 
 ## Environments

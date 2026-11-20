@@ -1,10 +1,11 @@
 import logging
-import math
 from typing import Any, List, Optional
 
 import torch
 import torch.nn.functional as F
 from typeguard import typechecked
+
+from espnet2.train.epoch_end_hook import TrainEpochEndHook
 
 
 class CTC(torch.nn.Module):
@@ -246,7 +247,7 @@ class CTC(torch.nn.Module):
         return align_label, align_prob
 
 
-class LabelPriorCTC(CTC):
+class LabelPriorCTC(CTC, TrainEpochEndHook):
     """CTC with label priors for less peaky alignments.
 
     Implementation of "Less peaky and more accurate CTC forced alignment by
@@ -256,9 +257,12 @@ class LabelPriorCTC(CTC):
     forward-backward. Since the resulting scores are no longer normalized,
     ``k2.CtcLoss`` is used instead of ``torch.nn.CTCLoss``.
 
-    The priors ``P(k)`` are initialized to a uniform distribution. During
-    training, the frame-level posteriors (without priors) are accumulated, and
-    ``update_prior()`` must be called at the end of every training epoch to
+    No prior correction is applied until the first successful
+    ``update_prior()`` call; the log-prior buffer is initialized to zero.
+    During training, the frame-level posteriors (without priors) are accumulated.
+    The normal ESPnet2 Trainer calls ``update_prior()`` automatically after
+    validation and before checkpoint saving, for use in the next epoch.
+    Custom training loops must call it at the end of every training epoch to
     replace the priors with the accumulated average posterior. Statistics are
     accumulated for every forward call in training mode (including
     intermediate CTC losses sharing this module). With DDP, every rank must
@@ -294,7 +298,7 @@ class LabelPriorCTC(CTC):
         ignore_nan_grad: Optional[bool] = None,
         zero_infinity: bool = True,
         prior_scaling_factor: float = 0.0,
-        output_beam: float = 1e20,
+        output_beam: float = 10,
         log_prior_floor: float = -12.0,
         **kwargs: Any,
     ):
@@ -325,8 +329,11 @@ class LabelPriorCTC(CTC):
             output_beam=output_beam, reduction="none", use_double_scores=True
         )
 
-        # log P(k), initialized to uniform: (V,)
-        self.register_buffer("log_prior", torch.full((odim,), -math.log(odim)))
+        # # log P(k), initialized to uniform: (V,)
+        # self.register_buffer("log_prior", torch.full((odim,), -math.log(odim)))
+
+        # log P(k), zero means no correction until the first update: (V,)
+        self.register_buffer("log_prior", torch.zeros(odim))
         # Sum of posteriors over training frames: (V,), float64
         # Plain attributes (not buffers) so that DDP does not overwrite the
         # per-rank statistics by broadcasting buffers from rank 0.
@@ -367,12 +374,17 @@ class LabelPriorCTC(CTC):
             self._prior_stats = torch.zeros_like(stats)
         self._prior_stats += stats  # (V,)
 
+    def on_train_epoch_end(self, epoch: int) -> None:
+        """Update the priors for the next epoch."""
+        self.update_prior()
+
     @torch.no_grad()
     def update_prior(self):
         """Update the label priors with the statistics accumulated so far.
 
-        Call this at the end of every training epoch. The statistics are
-        reset afterwards.
+        The normal ESPnet2 Trainer calls this through the epoch-end hook.
+        Custom loops must call it on every rank at the end of each training
+        epoch. The statistics are reset afterwards.
         """
         V = self.log_prior.numel()
         # Numerator: sum of posteriors over all frames in the epoch (V,)
@@ -429,6 +441,7 @@ class LabelPriorCTC(CTC):
 
         Infeasible examples (too short inputs) get an infinite loss, which is
         zeroed if ``zero_infinity`` is True, as in ``torch.nn.CTCLoss``.
+        Zeroed losses retain zero gradients even if every example is infeasible.
 
         Args:
             log_probs: log-posteriors with priors (B, Tmax, V)
@@ -478,6 +491,9 @@ class LabelPriorCTC(CTC):
             )
         if self.zero_infinity:
             loss = torch.where(torch.isinf(loss), torch.zeros_like(loss), loss)
+            if not indices:
+                # Connect zeros to the input without reading possibly -inf scores.
+                loss = loss + log_probs[:, :0, :].sum(dim=(1, 2))  # (B,)
         return loss
 
     def forced_align(

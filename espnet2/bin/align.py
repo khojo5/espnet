@@ -193,7 +193,11 @@ class ForcedAligner:
         )
         if isinstance(enc, tuple):
             enc = enc[0]
-        return self.network.ctc.log_softmax(enc)[0].cpu().numpy()
+        log_probs = self.network.ctc.log_softmax(enc)  # (1, T', V)
+        # Label-prior CTC (arXiv:2406.02560) scores alignment paths with priors.
+        if hasattr(self.network.ctc, "apply_prior"):
+            log_probs = self.network.ctc.apply_prior(log_probs)
+        return log_probs[0].cpu().numpy()
 
     def __call__(
         self,

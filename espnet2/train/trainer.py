@@ -37,6 +37,7 @@ from espnet2.torch_utils.safe_torch_load import safe_torch_load
 from espnet2.torch_utils.set_all_random_seed import set_all_random_seed
 from espnet2.train.abs_espnet_model import AbsESPnetModel
 from espnet2.train.distributed_utils import DistributedOption
+from espnet2.train.epoch_end_hook import TrainEpochEndHook, run_train_epoch_end_hooks
 from espnet2.train.reporter import Reporter, SubReporter
 from espnet2.utils.build_dataclass import build_dataclass
 from espnet2.utils.kwargs2args import kwargs2args
@@ -184,6 +185,13 @@ class Trainer:
         # NOTE(kamo): Don't check the type more strictly as far trainer_options
         assert is_dataclass(trainer_options), type(trainer_options)
         assert len(optimizers) == len(schedulers), (len(optimizers), len(schedulers))
+
+        if not distributed_option.distributed and trainer_options.ngpu > 1:
+            if any(isinstance(m, TrainEpochEndHook) for m in model.modules()):
+                raise ValueError(
+                    "Training-epoch state hooks do not support DataParallel. "
+                    "Use DistributedDataParallel (DDP) for multi-GPU training."
+                )
 
         if isinstance(trainer_options.keep_nbest_models, int):
             keep_nbest_models = [trainer_options.keep_nbest_models]
@@ -373,6 +381,8 @@ class Trainer:
                             reporter=sub_reporter,
                             options=trainer_options,
                         )
+
+            run_train_epoch_end_hooks(model, iepoch)
 
             # 2. LR Scheduler step
             for scheduler in schedulers:

@@ -1,9 +1,11 @@
 import math
+from datetime import timedelta
 
 import pytest
 import torch
 
 from espnet2.asr.ctc import CTC, LabelPriorCTC
+from espnet2.train.epoch_end_hook import run_train_epoch_end_hooks
 
 
 @pytest.fixture
@@ -112,13 +114,21 @@ def _ref_ctc_nll(log_probs, y):
 
 
 @pytest.mark.parametrize("reduce", [True, False])
-@pytest.mark.parametrize("non_uniform_prior", [False, True])
-def test_label_prior_ctc_alpha0_matches_builtin(reduce, non_uniform_prior):
+@pytest.mark.parametrize(
+    "prior_scaling_factor,non_uniform_prior",
+    [(0.0, False), (0.0, True), (0.3, False)],
+)
+def test_label_prior_ctc_without_correction_matches_builtin(
+    reduce, prior_scaling_factor, non_uniform_prior
+):
     pytest.importorskip("k2")
     h, h_lens, y, y_lens = _label_prior_ctc_inputs()
     builtin_ctc = CTC(encoder_output_size=10, odim=5, reduce=reduce)
     prior_ctc = LabelPriorCTC(
-        encoder_output_size=10, odim=5, reduce=reduce, prior_scaling_factor=0.0
+        encoder_output_size=10,
+        odim=5,
+        reduce=reduce,
+        prior_scaling_factor=prior_scaling_factor,
     )
     prior_ctc.ctc_lo.load_state_dict(builtin_ctc.ctc_lo.state_dict())
     if non_uniform_prior:
@@ -138,6 +148,49 @@ def test_label_prior_ctc_alpha0_matches_builtin(reduce, non_uniform_prior):
         torch.testing.assert_close(p1.grad, p2.grad, atol=1e-6, rtol=1e-5)
 
 
+@pytest.mark.parametrize("reduce", [True, False])
+@pytest.mark.parametrize("zero_infinity", [True, False])
+def test_label_prior_ctc_all_infeasible(reduce, zero_infinity):
+    pytest.importorskip("k2")
+    ctc = LabelPriorCTC(
+        encoder_output_size=4,
+        odim=3,
+        reduce=reduce,
+        zero_infinity=zero_infinity,
+    )
+    h = torch.randn(2, 2, 4, requires_grad=True)  # (B, T, D)
+    h_lens = torch.tensor([2, 2])  # (B,)
+    y = torch.tensor([[1, 1, -1], [1, 2, 1]])  # (B, L)
+    y_lens = torch.tensor([2, 3])  # (B,)
+    loss = ctc(h, h_lens, y, y_lens)  # () or (B,)
+    assert loss.shape == (() if reduce else (2,))
+    if zero_infinity:
+        torch.testing.assert_close(loss, torch.zeros_like(loss))
+        loss.sum().backward()
+        assert h.grad is not None
+        torch.testing.assert_close(h.grad, torch.zeros_like(h))
+        for parameter in ctc.ctc_lo.parameters():
+            assert parameter.grad is not None
+            torch.testing.assert_close(parameter.grad, torch.zeros_like(parameter))
+    else:
+        assert torch.isposinf(loss).all()
+
+
+def test_label_prior_ctc_all_infeasible_with_zero_probabilities():
+    pytest.importorskip("k2")
+    ctc = LabelPriorCTC(encoder_output_size=4, odim=3)
+    log_probs = torch.tensor(
+        [[[0.0, float("-inf"), float("-inf")]]], requires_grad=True
+    )  # (B, T, V)
+    loss = ctc._k2_ctc_loss(
+        log_probs, torch.tensor([1]), torch.tensor([[1, 1]]), torch.tensor([2])
+    )  # (B,)
+    torch.testing.assert_close(loss, torch.zeros_like(loss))
+    loss.sum().backward()
+    assert log_probs.grad is not None
+    torch.testing.assert_close(log_probs.grad, torch.zeros_like(log_probs))
+
+
 def test_label_prior_ctc_uniform_prior_shifts_loss_only():
     pytest.importorskip("k2")
     h, h_lens, y, y_lens = _label_prior_ctc_inputs()
@@ -147,6 +200,7 @@ def test_label_prior_ctc_uniform_prior_shifts_loss_only():
         encoder_output_size=10, odim=5, reduce=False, prior_scaling_factor=alpha
     )
     prior_ctc.ctc_lo.load_state_dict(builtin_ctc.ctc_lo.state_dict())
+    prior_ctc.log_prior.fill_(-math.log(5))
 
     h1 = h.clone().requires_grad_()
     h2 = h.clone().requires_grad_()
@@ -202,18 +256,20 @@ def test_label_prior_ctc_update_prior():
     pytest.importorskip("k2")
     h, h_lens, y, y_lens = _label_prior_ctc_inputs()
     prior_ctc = LabelPriorCTC(encoder_output_size=10, odim=5, prior_scaling_factor=0.3)
-    torch.testing.assert_close(prior_ctc.log_prior, torch.full((5,), -math.log(5)))
+    torch.testing.assert_close(prior_ctc.log_prior, torch.zeros(5))
 
     # No statistics are accumulated in eval mode
     prior_ctc.eval()
     prior_ctc(h, h_lens, y, y_lens)
     prior_ctc.update_prior()
-    torch.testing.assert_close(prior_ctc.log_prior, torch.full((5,), -math.log(5)))
+    torch.testing.assert_close(prior_ctc.log_prior, torch.zeros(5))
 
     prior_ctc.train()
     prior_ctc(h, h_lens, y, y_lens)
     prior_ctc(h[:2], h_lens[:2], y[:2], y_lens[:2])
-    prior_ctc.update_prior()
+    prior_ctc.eval()
+    prior_ctc(h * 3, h_lens, y, y_lens)
+    run_train_epoch_end_hooks(prior_ctc, epoch=1)
 
     with torch.no_grad():
         probs = prior_ctc.softmax(h)
@@ -223,6 +279,46 @@ def test_label_prior_ctc_update_prior():
     torch.testing.assert_close(prior_ctc.log_prior.exp(), expected)
     assert prior_ctc._prior_stats is None
     assert "log_prior" in prior_ctc.state_dict()
+
+
+def _distributed_prior_worker(rank, init_method):
+    torch.set_num_threads(1)
+    torch.distributed.init_process_group(
+        "gloo",
+        init_method=init_method,
+        rank=rank,
+        world_size=2,
+        timeout=timedelta(seconds=60),
+    )
+    try:
+        ctc = LabelPriorCTC(encoder_output_size=2, odim=3)
+        stats = [[2.0, 1.0, 1.0], [1.0, 3.0, 2.0]]
+        ctc._prior_stats = torch.tensor(stats[rank], dtype=torch.float64)  # (V,)
+        run_train_epoch_end_hooks(ctc, epoch=1)
+        torch.testing.assert_close(ctc.log_prior.exp(), torch.tensor([0.3, 0.4, 0.3]))
+        assert ctc._prior_stats is None
+
+        if rank == 1:
+            ctc._prior_stats = torch.tensor([1.0, 2.0, 1.0], dtype=torch.float64)
+        run_train_epoch_end_hooks(ctc, epoch=2)
+        torch.testing.assert_close(ctc.log_prior.exp(), torch.tensor([0.25, 0.5, 0.25]))
+        assert ctc._prior_stats is None
+    finally:
+        torch.distributed.destroy_process_group()
+
+
+def test_label_prior_ctc_distributed_epoch_update(tmp_path):
+    pytest.importorskip("k2")
+    if (
+        not torch.distributed.is_available()
+        or not torch.distributed.is_gloo_available()
+    ):
+        pytest.skip("Gloo distributed backend is unavailable")
+    torch.multiprocessing.spawn(
+        _distributed_prior_worker,
+        args=((tmp_path / "prior_group").as_uri(),),
+        nprocs=2,
+    )
 
 
 def test_label_prior_ctc_update_prior_floor():
